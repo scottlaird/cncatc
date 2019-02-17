@@ -26,9 +26,15 @@
 */
 
 // include the library code:
-#include <LiquidCrystal.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1325.h>
 
 // I/O pin definitions
+const int oledCS=48; // Green wire
+const int oledReset=47; // Orange wire
+const int oledDC=49; // Blue wire
+
 const int pinDcAmps=A0;
 const int pinSpindleAmps=A1;
 const int pinVacAmps=A2;
@@ -55,12 +61,12 @@ const int pinAirC=7;
 // cleverer than this; it needs to stay fixed if the input voltage is
 // close to the existing setpoint, but then skew faster once it's
 // clearly out of bounds.  TODO(laird): review literature.
-const double v5000=521.8;
-const double v25000=600.5;
+const double v5000=524.5;
+const double v25000=643;
 const double v_off=512;
 
 
-// Spindle States
+// Spindle States.
 const int stateSpindleOff=0;  // Can go to SpeedChanging or ToolChangeStart
 const int stateSpindleSpeedChanging=1; // Can go to Off or Steady
 const int stateSpindleSpeedSteady=2; // Can go to Changing
@@ -69,10 +75,57 @@ const int stateSpindleToolChanging=4; // Can go to ToolChangeWait
 const int stateSpindleToolChangeWait=5; // Can go to Off
 int stateSpindle = stateSpindleOff;
 
+Adafruit_SSD1325 display(oledDC, oledReset,oledCS);
 
-// initialize the library by associating any needed LCD interface pin
-// with the arduino pin number it is connected to
-LiquidCrystal lcd(38,39,40,41,42,43);
+// DisplayMessages are a timestamp and a pointer to a constant string.  The string will not be freed.
+struct DisplayMessage {
+  unsigned long timestamp;
+  char *message;
+  // Add a priority?
+};
+
+// set timestamp=0 once free.
+const int messagelimit=10;
+struct DisplayMessage messages[messagelimit];
+
+void DisplayMessage(char *message) {
+  unsigned long timestamp = millis();
+
+  for (int i=0; i<messagelimit; i++) {
+    if (messages[i].timestamp==0) {
+      messages[i].timestamp = timestamp;
+      messages[i].message=message;
+      return;
+    }
+  }
+  // Failed to find a free slot.
+  Serial.println(">>> displaymessage failed=true");
+}
+
+void CleanMessages() {
+  unsigned long oldest_timestamp = millis() - 10000;
+  
+  for (int i=0; i<messagelimit; i++) {
+    if (messages[i].timestamp < oldest_timestamp) {
+      messages[i].timestamp=0;
+      messages[i].message=0;
+    }
+  }
+}
+
+char *GetNewestMessage() {
+  unsigned long newest_timestamp = 0;
+  char *newest_message = 0;
+
+  for (int i=0; i<messagelimit; i++) {
+    if (messages[i].timestamp > newest_timestamp) {
+      newest_timestamp=messages[i].timestamp;
+      newest_message=messages[i].message;
+    }
+  }
+
+  return newest_message;
+}
 
 // Calculate amps given a raw analog reading from an ACS712 current
 // measurement IC.  These come in a few different sizes (5, 20, 30
@@ -163,9 +216,10 @@ void setup() {
   pinMode(pinAirB, OUTPUT);
   pinMode(pinAirC, OUTPUT);
 
-  // set up the LCD's number of columns and rows:
-  lcd.begin(16, 2);
-  lcd.print("System starting.");
+  display.begin();
+  display.display();
+  delay(1000);
+  display.clearDisplay();
 }
 
 double dcAmps, spindleAmps, vacAmps, compressorAmps;
@@ -214,7 +268,7 @@ void readGrbl() {
 long doneToolChangeStart, doneToolChangeWait;
 
 void loop() {
-  int rpm;
+  int rpm, effectiveRpm;
   int wantToolChange;
 
   // Generic serial logging format: start with '>>> ', then a word
@@ -233,32 +287,39 @@ void loop() {
   rpm = analogToRpm(avgSpindleSpeed);
 
   switch (stateSpindle) {
-  case stateSpindleOff:
+  case stateSpindleOff: 
+    effectiveRpm=0;
     if (wantToolChange) {
       Serial.println(">>> spindlestate old=off new=toolchangestart");
+      DisplayMessage("Starting tool change");
       stateSpindle=stateSpindleToolChangeStart;
       doneToolChangeStart = millis() + 5000; // 5 second wait to make sure the spindle has spun down completely.
     } else if (rpm > 0) {
       Serial.println(">>> spindlestate old=off new=speedchanging");
+      DisplayMessage("Spindle starting");
       stateSpindle=stateSpindleSpeedChanging;
     }
     break;
   case stateSpindleSpeedChanging:
+    effectiveRpm=rpm;
     if (rpm > 0) {
       Serial.println(">>> spindlestate old=speedchanging new=speedsteady");
       stateSpindle=stateSpindleSpeedSteady;
     } else {
       Serial.println(">>> spindlestate old=speedchanging new=off");
+      DisplayMessage("Spindle stoping");
       stateSpindle=stateSpindleOff;
     }
     break;
   case stateSpindleSpeedSteady: 
+    effectiveRpm=rpm;
     Serial.println(">>> spindlestate old=speedsteady new=speedchanging");
     stateSpindle=stateSpindleSpeedChanging;
     break;
   case stateSpindleToolChangeStart:
     if (millis() > doneToolChangeStart) {
       Serial.println(">>> spindlestate old=toolchangestart new=toolchanging");
+      DisplayMessage("Unlocking tool");
       stateSpindle=stateSpindleToolChanging;
     }
     break;
@@ -268,6 +329,7 @@ void loop() {
     
     if (!wantToolChange) {
       Serial.println(">>> spindlestate old=toolchanging new=toolchangewait");
+      DisplayMessage("Locking tool");
       doneToolChangeWait = millis() + 5000;  // 5 second wait before unlocking spindle.
       stateSpindle = stateSpindleToolChangeWait;
     }
@@ -277,28 +339,65 @@ void loop() {
     digitalWrite(pinAirB, 0);  // lock
     if (millis() > doneToolChangeWait) {
       Serial.println(">>> spindlestate old=toolchangewait new=off");
+      DisplayMessage("Tool change complete");
       stateSpindle=stateSpindleOff;
     }
     break;
   }
   
-  lcd.clear();
-  lcd.print("DC: ");
-  lcd.print(dcAmps, 3);
-  lcd.print("A");
+  //lcd.clear();
+  //lcd.print("DC: ");
+  //lcd.print(dcAmps, 3);
+  //lcd.print("A");
 
-  lcd.setCursor(0, 1);
-  lcd.print(millis() / 1000);
+  //lcd.setCursor(0, 1);
+  //lcd.print(millis() / 1000);
+
+  char buf[40];
+
+  display.clearDisplay();  // Probably slow
+  display.setTextColor(WHITE); 
+  display.setTextSize(2);
+  display.setCursor(0,0);
+  int sa = spindleAmps * 10 + 0.5;
+  int sa_fullamps = sa/10;
+  int sa_fractionamps = sa-sa_fullamps*10;
+  
+  display.print(sa_fullamps);
+  display.print(".");
+  display.print(sa_fractionamps);
+  display.setTextSize(1);
+  display.print("A");
+  
+  display.setCursor(128-78,0); // 6 pixel wide font.  "RPM" + 5 double-width characters = 13*6=78.
+  display.setTextSize(2);
+  sprintf(buf,"%5d", effectiveRpm);
+  display.print(buf);
+  display.setTextSize(1);
+  display.println("RPM");
+  display.setTextSize(1);
+  display.println("");
+
+  char *message = GetNewestMessage();
+
+  if(message) {
+    display.setTextSize(1);
+    display.setCursor(0,64-8);
+    display.println(message);
+  }
+
+  display.display();
+  CleanMessages();
   
   Serial.print("RPM = ");
-  Serial.print(rpm);
+  Serial.print(effectiveRpm);
   Serial.println(" RPM");
 
   //digitalWrite(pinAirA, airState);
   //digitalWrite(pinAirB, airState);
   //digitalWrite(pinAirC, airState);
 
-  digitalWrite(pinSpindleOnOff, rpm > 0);
+  digitalWrite(pinSpindleOnOff, effectiveRpm > 0);
 
   delay(100);
 
