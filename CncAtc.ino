@@ -29,6 +29,7 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1325.h>
+#include <eRCaGuy_Timer2_Counter.h>
 
 // I/O pin definitions
 const int oledCS=48; // Green wire
@@ -37,40 +38,33 @@ const int oledDC=49; // Blue wire
 
 const int pinDcAmps=A0;
 const int pinSpindleAmps=A1;
-const int pinVacAmps=A2;
-const int pinCompressorAmps=A3;
-const int pinCncSpindleSpeed=A4;
+const int pinCompressorAmps=A2;
+const int pinVacAmps=A3;
+const int pinAirPressure=A5;
 
-const int pinCncSpindleDirection=2; // M3 on GRBL sets this to 0, M4 sets to 1.
-const int pinCncCoolant=3;  // M8 on GRBL sets this to 0, M9 sets this to 1.
-const int pinSpindleOnOff=4;
-const int pinAirA=5;
-const int pinAirB=6;
-const int pinAirC=7;
+const int pinCncSpindleSpeed=2;
+const int intCncSpindleSpeed=0;  // Interrupt bound to pin 2.
 
-// RPM metrics.  v5000 is the value read on pinCncSpindleSpeed when
-// GRBL is sending 5,000 RPM.  v25000 is the value read on
-// pinCncSpindleSpeed when GRBL is sending 25,000 RPM.  Finally,
-// anything under v_off is considered to be 'off'.
-//
-// There really needs to be a state machine here that limits
-// transitions in and out of 'off' and blocks the spindle from
-// spinning while the ATC is in operation.  Also, spindle speed is
-// currently tracked using a decaying average, so we can average
-// readings across several cycles.  The produced RPM needs to be a bit
-// cleverer than this; it needs to stay fixed if the input voltage is
-// close to the existing setpoint, but then skew faster once it's
-// clearly out of bounds.  TODO(laird): review literature.
-const double v5000=524.5;
-const double v25000=643;
-const double v_off=512;
+const int pinCncSpindleDirection=4; // M3 on GRBL sets this to 0, M4 sets to 1.
+const int pinCncCoolant=5;  // M8 on GRBL sets this to 0, M9 sets this to 1.
+const int pinSpindleOnOff=6;
+const int pinAirBlower=7;
+const int pinAirEject=8;
+const int pinAirLock=9;
+const int pinFaultOut=10;
 
+const int pinStepperFault1=14;
+const int pinStepperFault2=15;
+const int pinStepperFault3=16;
+const int pinStepperFault4=17;
+
+const int pinSpindleSpeedOut=44;
 
 // Spindle States.
-const int stateSpindleOff=0;  // Can go to SpeedChanging or ToolChangeStart
-const int stateSpindleSpeedChanging=1; // Can go to Off or Steady
-const int stateSpindleSpeedSteady=2; // Can go to Changing
-const int stateSpindleToolChangeStart=3; // Can go to ToolChanging
+const int stateSpindleOff=0;  // Can go to Running or ToolChangeStart
+const int stateSpindleRunning=1; // Can go to Off
+const int stateSpindleToolChangeStart=2; // Will go to ToolChangeEject
+const int stateSpindleToolChangeEject=3; // Will go to ToolChanging
 const int stateSpindleToolChanging=4; // Can go to ToolChangeWait
 const int stateSpindleToolChangeWait=5; // Can go to Off
 int stateSpindle = stateSpindleOff;
@@ -164,7 +158,7 @@ double rawToAmps(int raw, int acs712_amps) {
     break;
   }
   voltage = raw / 1024.0 * 5000;
-  amps = (voltage - ACSoffset) / mVperAmp;
+  amps = fabs(voltage - ACSoffset) / mVperAmp;
   
   return amps;
 }
@@ -173,36 +167,94 @@ double decayingAverage(double a, double b, double fraction) {
   return a * fraction + b * (1 - fraction);
 }
 
-// Spindle speed notes:
-// 48 when CNC board powered totally off.
+// Spindle PWM reading code
+// Mostly from http://www.benripley.com/diy/arduino/three-ways-to-read-a-pwm-signal-with-arduino/
 //
-// Values measures with 0.1 weighted average, 100ms sample period.
-// GRBL has min speed set to 1000 and max speed set to 25000.  I
-// tried setting the minimum GRBL speed to 5000, but that left
-// almost no visible margin between 5000 RPM and off.  Reducing the
-// minimum in GRBL makes it much clearer.
+// Using 'timer2' from eRC...guy, with 0.5 usec resolution, because
+// millis() has 4us resolution, which is ~100ish RPM.
 //
-// ~508 when off (S0)
-// ~522 when 5000 (S5000)
-// ~528 when 6000 (S6000)
-// ~544 when 10000
-// ~580 when 20000
-// ~594 when 25000 (full speed).
+// Observed values, with $31=5000 and $32=25000 (min and max spindle speeds).
 //
-// So, over 20k RPM, we vary ~73 points, or 3.65 points per 1k RPM.
-// If it's linear, then v = (r/1000 - 5) * 3.65 + 525.  That'd put
-// 10k around 541, which is a bit low, but not horrible.  20k looks
-// okay for that.  Going the other way (which is really what we care
-// about), r = round((v-523)/3.7+5)*1000.  That rounds to the
-// nearest 1k RPM, which might be best.  Or maybe not.  Maybe just
-// for displaying?
+// - s0: Value doesn't update, because it never rises.
+// - s5000: 23
+// - s10000: ~523
+// - s20000: ~1540
+// - s24000: ~1946
+// - s24999: ~2043
+// - s25000: doesn't update, because it never falls.
+//
+// So, we need to handle s0 (off, no PWM) and s25000 (on, no PWM)
+// specially.  We'll do this via 'pwmSeen'.  We'll set it to 2 in each
+// interrupt handler and then decrement it in loop().  If it hits 0,
+// then we'll set RPMs to either 0 or 25000 based on digitalRead() of
+// the spindle pin.
 
 
-int analogToRpm(double v){
-  if (v < v_off)
-    return 0; // Off
-      
-  return ((v-v5000)/((v25000-v5000)/20.0)+5)*1000;
+volatile long pwmSpindleValue=0;
+volatile long pwmSpindleRiseTime=0;
+volatile int pwmSeen=0;
+const unsigned int spindleMin=5000;
+const unsigned int spindleMax=25000;
+
+void spindlePWMRising() {
+  attachInterrupt(intCncSpindleSpeed, spindlePWMFalling, FALLING);
+  pwmSeen=5;
+  pwmSpindleRiseTime=timer2.get_count(); //micros();
+}
+
+void spindlePWMFalling() {
+  attachInterrupt(intCncSpindleSpeed, spindlePWMRising, RISING);
+  pwmSeen=5;
+  pwmSpindleValue=timer2.get_count()-pwmSpindleRiseTime;  // was micros()
+}
+
+unsigned int readSpindleSpeed() {
+  unsigned int rpm;
+  
+  if(--pwmSeen<=0) {
+    pwmSeen=0;  // Don't want to to go ouboundedly negative.
+    // there's no PWM; it's either off on on.
+    rpm = digitalRead(pinCncSpindleSpeed) ? spindleMax : 0;
+  } else {
+    // We've seen a PWM interrupt during the last cycle
+    double v = pwmSpindleValue; // might change under us
+
+    const int min_value = 114;
+    const int max_value = 2042;
+    
+    v -= min_value;  // minimum observed value, ish
+    v /= (max_value-min_value); // observed range
+
+    if (v<0)
+      v=0;
+
+    if (v>1)
+      v=1;
+
+    rpm = (spindleMax-spindleMin)*v+spindleMin;
+    Serial.println(rpm);
+  }
+
+  rpm = (rpm + 5) / 10;
+  rpm = rpm * 10;
+
+  return rpm;
+}
+
+
+int rpmToAnalog(double rpm) {
+  double r, s;
+  
+  r = rpm-5000;
+  if (r<0)
+    r=0;
+
+  s=r/20000;
+
+  if (s>1)
+    s=1;
+  
+  return s*255;
 }
 
 void setup() {
@@ -210,20 +262,27 @@ void setup() {
   Serial.begin(115200);
   Serial.println(">>> booting");
 
+  timer2.setup();
+
+  // Set up PWM spindle interrupt
+  attachInterrupt(intCncSpindleSpeed, spindlePWMFalling, FALLING);
+
   // Set up pins
   pinMode(pinSpindleOnOff, OUTPUT);
-  pinMode(pinAirA, OUTPUT);
-  pinMode(pinAirB, OUTPUT);
-  pinMode(pinAirC, OUTPUT);
+  pinMode(pinAirLock, OUTPUT);
+  pinMode(pinAirEject, OUTPUT);
+  pinMode(pinAirBlower, OUTPUT);
+  pinMode(pinSpindleSpeedOut, OUTPUT);
+  pinMode(pinFaultOut, OUTPUT);
 
   display.begin();
+  display.clearDisplay();
   display.display();
   delay(1000);
-  display.clearDisplay();
 }
 
 double dcAmps, spindleAmps, vacAmps, compressorAmps;
-double avgSpindleSpeed;
+double avgRpm;
 
 void readAmps() {
   double new_dcAmps, new_spindleAmps, new_vacAmps, new_compressorAmps;
@@ -250,26 +309,63 @@ void readAmps() {
 
 int cncCoolant, cncSpindleDirection, cncSpindleSpeed;
 void readGrbl() {
-  cncSpindleSpeed=analogRead(pinCncSpindleSpeed);
   cncSpindleDirection=digitalRead(pinCncSpindleDirection);
   cncCoolant=digitalRead(pinCncCoolant);
-  avgSpindleSpeed=decayingAverage(cncSpindleSpeed, avgSpindleSpeed, 0.2);
 
   Serial.print(">>> grbl cool=");
   Serial.print(cncCoolant);
   Serial.print(" dir=");
   Serial.print(cncSpindleDirection);
-  Serial.print(" rawSpeed=");
-  Serial.print(cncSpindleSpeed);
-  Serial.print(" avgSpeed=");
-  Serial.println(avgSpindleSpeed);
+}
+
+double airPressure; // in PSI
+const double zeroAirPressure = 496;
+const double fullAirPressure = 784;
+
+// Read from the air pressure sensor and set airPressure to the pressure in PSI.
+//
+// Measured values:
+// 0 PSI: 496
+// 100 PSI: 784
+//
+void readPressure() {
+  int raw;
+  
+  raw = analogRead(pinAirPressure);
+  airPressure = (raw - zeroAirPressure)/(fullAirPressure-zeroAirPressure)*100;
+  Serial.print(">>> pressure raw=");
+  Serial.print(raw);
+  Serial.print(" psi=");
+  Serial.println(airPressure);
+}
+
+int faultStepper1, faultStepper2, faultStepper3, faultStepper4;
+int faultReceived;
+void readFault() {
+  faultStepper1=digitalRead(pinStepperFault1);
+  faultStepper2=digitalRead(pinStepperFault2);
+  faultStepper3=digitalRead(pinStepperFault3);
+  faultStepper4=digitalRead(pinStepperFault4);
+
+  Serial.print(">>> fault stepper1=");
+  Serial.print(faultStepper1);
+  Serial.print(" stepper2=");
+  Serial.print(faultStepper2);
+  Serial.print(" stepper3=");
+  Serial.print(faultStepper3);
+  Serial.print(" stepper4=");
+  Serial.println(faultStepper4);
+  
+  faultReceived |= faultStepper1||faultStepper2||faultStepper3||faultStepper4;
 }
 
 long doneToolChangeStart, doneToolChangeWait;
+long doneEjectPhase;
+int ejectPhase;
 
 void loop() {
-  int rpm, effectiveRpm;
-  int wantToolChange;
+  unsigned int rawRpm, rpm, effectiveRpm;
+  int wantToolChange, wantCoolant, enableBlower;
 
   // Generic serial logging format: start with '>>> ', then a word
   // that describes which type of logging, then 0 or more name=value
@@ -280,11 +376,17 @@ void loop() {
   Serial.println(stateSpindle);
 
   readAmps();
+  readPressure();
   readGrbl();
+  readFault();
 
-  wantToolChange=cncCoolant==0 && cncSpindleDirection==1;
+  wantToolChange = cncSpindleDirection==1;
+  wantCoolant = cncCoolant==0;
+  enableBlower = 0;
 
-  rpm = analogToRpm(avgSpindleSpeed);
+  rpm = readSpindleSpeed();
+  //avgRpm=decayingAverage(rawRpm, avgRpm, 0.2);
+  //rpm = avgRpm;
 
   switch (stateSpindle) {
   case stateSpindleOff: 
@@ -295,37 +397,55 @@ void loop() {
       stateSpindle=stateSpindleToolChangeStart;
       doneToolChangeStart = millis() + 5000; // 5 second wait to make sure the spindle has spun down completely.
     } else if (rpm > 0) {
-      Serial.println(">>> spindlestate old=off new=speedchanging");
+      Serial.println(">>> spindlestate old=off new=spindlerunning");
       DisplayMessage("Spindle starting");
-      stateSpindle=stateSpindleSpeedChanging;
+      stateSpindle=stateSpindleRunning;
     }
     break;
-  case stateSpindleSpeedChanging:
+  case stateSpindleRunning: 
     effectiveRpm=rpm;
-    if (rpm > 0) {
-      Serial.println(">>> spindlestate old=speedchanging new=speedsteady");
-      stateSpindle=stateSpindleSpeedSteady;
-    } else {
-      Serial.println(">>> spindlestate old=speedchanging new=off");
-      DisplayMessage("Spindle stoping");
+    if (rpm>0) {
+      enableBlower=wantCoolant;
+    } else if (rpm == 0) {
+      Serial.println(">>> spindlestate old=running new=off");
+      DisplayMessage("Spindle stopping");
       stateSpindle=stateSpindleOff;
     }
     break;
-  case stateSpindleSpeedSteady: 
-    effectiveRpm=rpm;
-    Serial.println(">>> spindlestate old=speedsteady new=speedchanging");
-    stateSpindle=stateSpindleSpeedChanging;
-    break;
   case stateSpindleToolChangeStart:
     if (millis() > doneToolChangeStart) {
-      Serial.println(">>> spindlestate old=toolchangestart new=toolchanging");
-      DisplayMessage("Unlocking tool");
-      stateSpindle=stateSpindleToolChanging;
+      Serial.println(">>> spindlestate old=toolchangestart new=toolchangeeject");
+      DisplayMessage("Ejecting tool");
+      stateSpindle=stateSpindleToolChangeEject;
+      ejectPhase=0;
+    }
+    break;
+  case stateSpindleToolChangeEject:
+    // Eject the tool.  500ms on, 500ms off, 500ms on, 500ms off.
+    // Phase 0 is starting.  Phase 1 and 3 have the eject air on.  Phases 2 and 4 have it off.
+    if (ejectPhase==0) {
+      ejectPhase=1;
+      doneEjectPhase=millis()+500;
+      digitalWrite(pinAirLock, 1);  // Unlock
+      digitalWrite(pinAirEject, 1);
+    } else if (millis() > doneEjectPhase) {
+      ejectPhase++;
+      Serial.print(">>> ejectstate phase=");
+      Serial.println(ejectPhase);
+      doneEjectPhase=millis()+500;
+      if (ejectPhase>=4) {
+	Serial.println(">>> spindlestate old=toolchangeeject new=toolchanging");
+	DisplayMessage("Tool unlocked");
+	stateSpindle=stateSpindleToolChanging;
+	digitalWrite(pinAirEject, 0);
+	break;
+      }
+      digitalWrite(pinAirEject, ejectPhase&1);  // Eject on odd numbered phases.
     }
     break;
   case stateSpindleToolChanging:
-    digitalWrite(pinAirA, 1);  // Unlock
-    digitalWrite(pinAirB, 1);  // TODO(laird): pulse 500ms on, 500ms off, 500ms on, 500ms off
+    digitalWrite(pinAirLock, 1);
+    digitalWrite(pinAirEject, 0);
     
     if (!wantToolChange) {
       Serial.println(">>> spindlestate old=toolchanging new=toolchangewait");
@@ -335,8 +455,8 @@ void loop() {
     }
     break;
   case stateSpindleToolChangeWait:
-    digitalWrite(pinAirA, 0);  // lock
-    digitalWrite(pinAirB, 0);  // lock
+    digitalWrite(pinAirLock, 0);  // lock
+    digitalWrite(pinAirEject, 0);  // lock
     if (millis() > doneToolChangeWait) {
       Serial.println(">>> spindlestate old=toolchangewait new=off");
       DisplayMessage("Tool change complete");
@@ -345,21 +465,16 @@ void loop() {
     break;
   }
   
-  //lcd.clear();
-  //lcd.print("DC: ");
-  //lcd.print(dcAmps, 3);
-  //lcd.print("A");
-
-  //lcd.setCursor(0, 1);
-  //lcd.print(millis() / 1000);
-
+  digitalWrite(pinAirBlower, enableBlower);
+  digitalWrite(pinFaultOut, faultReceived);
+  
   char buf[40];
 
   display.clearDisplay();  // Probably slow
   display.setTextColor(WHITE); 
   display.setTextSize(2);
   display.setCursor(0,0);
-  int sa = spindleAmps * 10 + 0.5;
+  int sa = abs(spindleAmps * 10 + 0.5);
   int sa_fullamps = sa/10;
   int sa_fractionamps = sa-sa_fullamps*10;
   
@@ -389,16 +504,12 @@ void loop() {
   display.display();
   CleanMessages();
   
-  Serial.print("RPM = ");
-  Serial.print(effectiveRpm);
-  Serial.println(" RPM");
-
-  //digitalWrite(pinAirA, airState);
-  //digitalWrite(pinAirB, airState);
-  //digitalWrite(pinAirC, airState);
+  int analogRpm = rpmToAnalog(effectiveRpm);
 
   digitalWrite(pinSpindleOnOff, effectiveRpm > 0);
 
+  analogWrite(pinSpindleSpeedOut, rpmToAnalog(effectiveRpm));
+  
   delay(100);
 
 }
