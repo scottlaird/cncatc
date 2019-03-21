@@ -23,6 +23,25 @@
   from Adafruit via SPI.  The display will show the current RPM,
   current readings, and tool change status.
 
+
+  Tool change procedure:
+  - Stop spindle: M3 S0  (S0 is good enough)
+  - Move to wherever you want the tool to live.  An open slot in a
+    tool rack would be ideal, and also cheaper than most of the
+    alternatives. 
+  - Unlock and eject the tool: M4 S1500 (M4 is "spin backwards", S1500
+    is spin at 1500 RPM.  The FME-W can't do either of these things
+  - The display will say "Unlocking tool" and wait for 5 seconds.
+  - Then it will eject the tool, leaving the spindle unlocked.
+  - Next, move to the location of the next tool.
+  - To lock the spindle: M3 S0.
+  - Once this occurs, the tool will be locked, but this code will
+    refuse to start spinning for 5 seconds.  Use that time to move the
+    spindle up away from the tool rack.
+  - To start spinning, use M3 S10000 (or whatever RPM), just like
+    normal.  Your CAM preprocessor almost certainly put one of these
+    into your gcode for you.
+
 */
 
 // include the library code:
@@ -51,12 +70,12 @@ const int pinSpindleOnOff=6;
 const int pinAirBlower=7;
 const int pinAirEject=8;
 const int pinAirLock=9;
-const int pinFaultOut=10;
+const int pinFaultOut=18;
 
-const int pinStepperFault1=14;
-const int pinStepperFault2=15;
-const int pinStepperFault3=16;
-const int pinStepperFault4=17;
+const int pinStepperFault1=14;  // X
+const int pinStepperFault2=15;  // Y1
+const int pinStepperFault3=16;  // Y2
+const int pinStepperFault4=17;  // Z
 
 const int pinSpindleSpeedOut=44;
 
@@ -193,7 +212,7 @@ double decayingAverage(double a, double b, double fraction) {
 volatile long pwmSpindleValue=0;
 volatile long pwmSpindleRiseTime=0;
 volatile int pwmSeen=0;
-const unsigned int spindleMin=5000;
+const unsigned int spindleMin=1000;
 const unsigned int spindleMax=25000;
 
 void spindlePWMRising() {
@@ -219,9 +238,12 @@ unsigned int readSpindleSpeed() {
     // We've seen a PWM interrupt during the last cycle
     double v = pwmSpindleValue; // might change under us
 
-    const int min_value = 114;
+    const int min_value = 58;  // For $31=500 and spindleMin=1000.
     const int max_value = 2042;
     
+    Serial.print(">>> rpm val=");
+    Serial.print(v);
+
     v -= min_value;  // minimum observed value, ish
     v /= (max_value-min_value); // observed range
 
@@ -231,8 +253,9 @@ unsigned int readSpindleSpeed() {
     if (v>1)
       v=1;
 
-    rpm = (spindleMax-spindleMin)*v+spindleMin;
+    Serial.print(" rpm=");
     Serial.println(rpm);
+    rpm = (spindleMax-spindleMin)*v+spindleMin;
   }
 
   rpm = (rpm + 5) / 10;
@@ -245,11 +268,15 @@ unsigned int readSpindleSpeed() {
 int rpmToAnalog(double rpm) {
   double r, s;
   
-  r = rpm-5000;
+  r = rpm-5000 + 2550; // 2550 offset measured to get 5000 RPM working accurately.
   if (r<0)
     r=0;
 
-  s=r/20000;
+  //s=r/20000;
+  s=r/22133; // at s20000 (r=17550 with offset above), spindle
+	     // measures 21600 RPM.  So, asking for an increase of
+	     // 15000 gives us 16600 extra RPM.  Therefore, increasing
+	     // the divisor to 16.6/15*20000=22133.
 
   if (s>1)
     s=1;
@@ -275,6 +302,11 @@ void setup() {
   pinMode(pinSpindleSpeedOut, OUTPUT);
   pinMode(pinFaultOut, OUTPUT);
 
+  pinMode(pinStepperFault1, INPUT_PULLUP);
+  pinMode(pinStepperFault2, INPUT_PULLUP);
+  pinMode(pinStepperFault3, INPUT_PULLUP);
+  pinMode(pinStepperFault4, INPUT_PULLUP);
+
   display.begin();
   display.clearDisplay();
   display.display();
@@ -282,7 +314,6 @@ void setup() {
 }
 
 double dcAmps, spindleAmps, vacAmps, compressorAmps;
-double avgRpm;
 
 void readAmps() {
   double new_dcAmps, new_spindleAmps, new_vacAmps, new_compressorAmps;
@@ -315,7 +346,7 @@ void readGrbl() {
   Serial.print(">>> grbl cool=");
   Serial.print(cncCoolant);
   Serial.print(" dir=");
-  Serial.print(cncSpindleDirection);
+  Serial.println(cncSpindleDirection);
 }
 
 double airPressure; // in PSI
@@ -328,7 +359,7 @@ const double fullAirPressure = 784;
 // 0 PSI: 496
 // 100 PSI: 784
 //
-void readPressure() {
+void readPressure(void) {
   int raw;
   
   raw = analogRead(pinAirPressure);
@@ -341,13 +372,35 @@ void readPressure() {
 
 int faultStepper1, faultStepper2, faultStepper3, faultStepper4;
 int faultReceived;
-void readFault() {
-  faultStepper1=digitalRead(pinStepperFault1);
-  faultStepper2=digitalRead(pinStepperFault2);
-  faultStepper3=digitalRead(pinStepperFault3);
-  faultStepper4=digitalRead(pinStepperFault4);
+void readFault(void) {
+  int newFaultReceived;
 
-  Serial.print(">>> fault stepper1=");
+  // These are all inverted.
+  faultStepper1=!digitalRead(pinStepperFault1);
+  faultStepper2=!digitalRead(pinStepperFault2);
+  faultStepper3=!digitalRead(pinStepperFault3);
+  faultStepper4=!digitalRead(pinStepperFault4);
+
+  newFaultReceived = faultStepper1||faultStepper2||faultStepper3||faultStepper4;
+  faultReceived = newFaultReceived;  // Not sure if it should latch onto true and stay there or not.
+
+  if (newFaultReceived) {
+    if (faultStepper1) {
+      DisplayMessage("Fault on X Stepper");
+    } else if (faultStepper2) {
+      DisplayMessage("Fault on Y1 Stepper");
+    } else if (faultStepper3) {
+      DisplayMessage("Fault on Y2 Stepper");
+    } else if (faultStepper4) {
+      DisplayMessage("Fault on Z Stepper");
+    } else {
+      DisplayMessage("Unknown Stepper Fault");
+    }
+  }
+
+  Serial.print(">>> fault received=");
+  Serial.print(faultReceived);
+  Serial.print(" stepper1=");
   Serial.print(faultStepper1);
   Serial.print(" stepper2=");
   Serial.print(faultStepper2);
@@ -355,8 +408,6 @@ void readFault() {
   Serial.print(faultStepper3);
   Serial.print(" stepper4=");
   Serial.println(faultStepper4);
-  
-  faultReceived |= faultStepper1||faultStepper2||faultStepper3||faultStepper4;
 }
 
 long doneToolChangeStart, doneToolChangeWait;
@@ -385,18 +436,16 @@ void loop() {
   enableBlower = 0;
 
   rpm = readSpindleSpeed();
-  //avgRpm=decayingAverage(rawRpm, avgRpm, 0.2);
-  //rpm = avgRpm;
 
   switch (stateSpindle) {
   case stateSpindleOff: 
     effectiveRpm=0;
-    if (wantToolChange) {
+    if (wantToolChange && rpm > 1000 && rpm < 2000) {
       Serial.println(">>> spindlestate old=off new=toolchangestart");
       DisplayMessage("Starting tool change");
       stateSpindle=stateSpindleToolChangeStart;
       doneToolChangeStart = millis() + 5000; // 5 second wait to make sure the spindle has spun down completely.
-    } else if (rpm > 0) {
+    } else if (rpm >= 4900) {
       Serial.println(">>> spindlestate old=off new=spindlerunning");
       DisplayMessage("Spindle starting");
       stateSpindle=stateSpindleRunning;
@@ -404,12 +453,12 @@ void loop() {
     break;
   case stateSpindleRunning: 
     effectiveRpm=rpm;
-    if (rpm>0) {
-      enableBlower=wantCoolant;
-    } else if (rpm == 0) {
+    if (rpm < 4000) {
       Serial.println(">>> spindlestate old=running new=off");
       DisplayMessage("Spindle stopping");
       stateSpindle=stateSpindleOff;
+    } else {
+      enableBlower=wantCoolant;
     }
     break;
   case stateSpindleToolChangeStart:
@@ -466,7 +515,7 @@ void loop() {
   }
   
   digitalWrite(pinAirBlower, enableBlower);
-  digitalWrite(pinFaultOut, faultReceived);
+  digitalWrite(pinFaultOut, !faultReceived);  // actually backwards.
   
   char buf[40];
 
