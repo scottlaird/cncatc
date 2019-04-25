@@ -533,7 +533,18 @@ void loop() {
   }
   
   digitalWrite(pinAirBlower, enableBlower);
-  digitalWrite(pinFaultOut, !faultReceived);  // actually backwards.
+
+  if (faultReceived) {
+    // Grounds the pin, which triggers an e-stop fault on the GRBL
+    // controller.  This should stop all movement, turn off the
+    // spindle, etc.
+    pinMode(pinFaultOut, OUTPUT);
+    digitalWrite(pinFaultOut, LOW);
+  } else {
+    // Sets the fault pin to high impedence, which allows the GRBL
+    // controller to process like normal.
+    pinMode(pinFaultOut, INPUT);
+  }
   
   char buf[40];
 
