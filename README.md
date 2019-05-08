@@ -1,3 +1,5 @@
+# CncAtc
+
 CncAtc is an Arduino program for connecting an AMB 1050 FME-W DI tool-changing
 spindle to a GRBL CNC controller.  This is one of the cheapest ways to create a
 working tool-changing CNC machine.
@@ -15,4 +17,6 @@ pressure monitoring can be easily removed (or just ignored), and the core is
 decent enough.  If there's interest, then I can work on making it more
 generically useful over time.
 
-Disclaimer: This is not an officially supported Google product.
+### Disclaimer
+
+This is not an officially supported Google product.
